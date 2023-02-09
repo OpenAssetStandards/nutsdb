@@ -227,6 +227,74 @@ func (tx *Tx) GetAll(bucket string) (entries Entries, err error) {
 }
 
 // RangeScan query a range at given bucket, start and end slice.
+func (tx *Tx) FirstScan(bucket string, start, end []byte, offsetNum int) (*Entry, error) {
+	if err := tx.checkTxIsClosed(); err != nil {
+		return nil, err
+	}
+
+	if tx.db.opt.EntryIdxMode == HintBPTSparseIdxMode {
+		newStart, newEnd := getNewKey(bucket, start), getNewKey(bucket, end)
+		r, _, err := tx.db.ActiveBPTreeIdx.FirstScan(newStart, newEnd, offsetNum)
+		if err == nil && r != nil {
+			path := tx.db.getDataPath(r.H.FileID)
+			df, err := tx.db.fm.getDataFile(path, tx.db.opt.SegmentSize)
+			if err != nil {
+				releaseErr := df.rwManager.Release()
+				if releaseErr != nil {
+					return nil, releaseErr
+				}
+				return nil, err
+			}
+
+			item, err := df.ReadAt(int(r.H.DataPos))
+			if err != nil {
+
+				releaseErr := df.rwManager.Release()
+				if releaseErr != nil {
+					return nil, releaseErr
+				}
+				return nil, fmt.Errorf("HintIdx r.Hi.dataPos %d, err %s", r.H.DataPos, err)
+			}
+			err = df.rwManager.Release()
+			if err != nil {
+				return nil, err
+			}
+			if !IsExpired(item.Meta.TTL, item.Meta.Timestamp) && item.Meta.Flag != DataDeleteFlag {
+				return item, nil
+			}
+		}
+
+		entry, err := tx.firstScanOnDisk(bucket, start, end, offsetNum)
+		if err != nil {
+			return nil, err
+		}
+		if entry == nil {
+			return nil, ErrRangeScan
+		}
+		return entry, nil
+	}
+
+	if index, ok := tx.db.BPTreeIdx[bucket]; ok {
+		record, _, err := index.FirstScan(start, end, offsetNum)
+		if err != nil {
+			return nil, ErrRangeScan
+		}
+
+		e2, err := tx.getHintIdxDataItemWrapper(record)
+		if err != nil {
+			return nil, ErrRangeScan
+		}
+		if e2 == nil {
+			return nil, ErrRangeScan
+		}
+		return e2, nil
+
+	}
+
+	return nil, ErrRangeScan
+}
+
+// RangeScan query a range at given bucket, start and end slice.
 func (tx *Tx) RangeScan(bucket string, start, end []byte) (es Entries, err error) {
 	if err := tx.checkTxIsClosed(); err != nil {
 		return nil, err
@@ -323,6 +391,41 @@ func (tx *Tx) rangeScanOnDisk(bucket string, start, end []byte) ([]*Entry, error
 	}
 
 	return result, nil
+}
+
+func (tx *Tx) firstScanOnDisk(bucket string, start, end []byte, offsetNum int) (*Entry, error) {
+
+	bptSparseIdxGroup := tx.db.BPTreeRootIdxes
+
+	SortFID(bptSparseIdxGroup, func(p, q *BPTreeRootIdx) bool {
+		return p.fID > q.fID
+	})
+
+	newStart, newEnd := getNewKey(bucket, start), getNewKey(bucket, end)
+	curOffset := 0
+
+	for _, bptSparseIdx := range bptSparseIdxGroup {
+		if compare(newStart, bptSparseIdx.start) <= 0 &&
+			compare(bptSparseIdx.start, newEnd) <= 0 ||
+			compare(newStart, bptSparseIdx.end) <= 0 &&
+				compare(bptSparseIdx.end, newEnd) <= 0 {
+
+			entry, off, err := tx.findFirstSearchOnDisk(bucket, int64(bptSparseIdx.fID), int64(bptSparseIdx.rootOff), start, end, newStart, offsetNum-curOffset)
+			if err != nil {
+				return nil, err
+			}
+			if entry != nil {
+				return entry, nil
+			}
+			curOffset += off
+			if curOffset > offsetNum {
+				return nil, nil
+			}
+
+		}
+	}
+
+	return nil, nil
 }
 
 func (tx *Tx) prefixScanOnDisk(bucket string, prefix []byte, offsetNum int, limitNum int) ([]*Entry, int, error) {
@@ -598,6 +701,71 @@ func (tx *Tx) findPrefixSearchOnDisk(bucket string, fID, rootOff int64, prefix [
 	off = coff
 
 	return
+}
+
+func (tx *Tx) findFirstSearchOnDisk(bucket string, fID, rootOff int64, start, end []byte, newStart []byte, offsetNum int) (es *Entry, off int, err error) {
+	var (
+		i, j  uint16
+		entry *Entry
+		curr  *BinaryNode
+	)
+
+	if curr, err = tx.FindLeafOnDisk(fID, rootOff, start, newStart); err != nil && curr == nil {
+		return nil, off, err
+	}
+
+	if j, err = tx.getStartIndexForFindPrefix(fID, curr, newStart); err != nil {
+		return nil, off, err
+	}
+
+	scanFlag := true
+	filepath := tx.db.getBPTPath(fID)
+
+	coff := 0
+
+	for curr != nil && scanFlag {
+		for i = j; i < curr.KeysNum; i++ {
+
+			if coff < offsetNum {
+				coff++
+				continue
+			}
+
+			df, err := tx.db.fm.getDataFile(tx.db.getDataPath(fID), tx.db.opt.SegmentSize)
+			if err != nil {
+				return nil, off, err
+			}
+
+			entry, err = df.ReadAt(int(curr.Keys[i]))
+			if err != nil {
+				return nil, off, err
+			}
+			err = df.rwManager.Release()
+			if err != nil {
+				return nil, off, err
+			}
+			if isKeyInRange(entry.Key, start, end) || string(entry.Meta.Bucket) != bucket {
+				scanFlag = false
+				break
+			}
+			return entry, coff, nil
+
+		}
+
+		address := curr.NextAddress
+		if address == DefaultInvalidAddress {
+			break
+		}
+		curr, err = ReadNode(filepath, address)
+		if err != nil {
+			return nil, off, err
+		}
+		j = 0
+	}
+
+	off = coff
+
+	return nil, 0, nil
 }
 
 func (tx *Tx) getStartIndexForFindRange(fID int64, curr *BinaryNode, start, newStart []byte) (uint16, error) {
@@ -913,6 +1081,41 @@ func (tx *Tx) getHintIdxDataItemsWrapper(records Records, limitNum int, es Entri
 	}
 
 	return es, nil
+}
+
+// getHintIdxDataItemsWrapper returns wrapped entries when prefix scanning or range scanning.
+func (tx *Tx) getHintIdxDataItemWrapper(r *Record) (*Entry, error) {
+	if r.H.Meta.Flag == DataDeleteFlag || r.IsExpired() {
+		return nil, nil
+	}
+
+	idxMode := tx.db.opt.EntryIdxMode
+	if idxMode == HintKeyAndRAMIdxMode {
+		path := tx.db.getDataPath(r.H.FileID)
+		df, err := tx.db.fm.getDataFile(path, tx.db.opt.SegmentSize)
+		if err != nil {
+			return nil, err
+		}
+		if item, err := df.ReadAt(int(r.H.DataPos)); err == nil {
+			return item, nil
+		} else {
+			releaseErr := df.rwManager.Release()
+			if releaseErr != nil {
+				return nil, releaseErr
+			}
+			return nil, fmt.Errorf("HintIdx r.Hi.dataPos %d, err %s", r.H.DataPos, err)
+		}
+		err = df.rwManager.Release()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if idxMode == HintKeyValAndRAMIdxMode {
+		return r.E, nil
+	}
+
+	return nil, nil
 }
 
 // FindTxIDOnDisk returns if txId on disk at given fid and txID.

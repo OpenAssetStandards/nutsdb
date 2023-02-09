@@ -15,6 +15,7 @@
 package nutsdb
 
 import (
+	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -261,6 +262,50 @@ func TestTx_RangeScan(t *testing.T) {
 			entries, err = tx.RangeScan(bucket, start, end)
 			assert.Error(t, err)
 			assert.Empty(t, entries)
+		}
+
+	})
+
+}
+func TestTx_FirstScan(t *testing.T) {
+	bucket := "bucket_for_first"
+
+	withDefaultDB(t, func(t *testing.T, db *DB) {
+
+		{
+			// setup the data
+
+			tx, err := db.Begin(true)
+			require.NoError(t, err)
+
+			for i := 0; i < 10; i++ {
+				key := []byte("key_" + fmt.Sprintf("%07d", i*i))
+				val := []byte("valvalvalvalvalvalvalvalval" + fmt.Sprintf("%07d", i))
+				err = tx.Put(bucket, key, val, Persistent)
+				assert.NoError(t, err)
+			}
+
+			assert.NoError(t, tx.Commit()) // tx commit
+		}
+
+		{
+
+			tx, err = db.Begin(false)
+			require.NoError(t, err)
+
+			var (
+				s = 18
+				e = 37
+			)
+
+			start := []byte(fmt.Sprintf("key_%07d", s))
+			end := []byte(fmt.Sprintf("key_%07d", e))
+
+			entry, err := tx.FirstScan(bucket, start, end, 0)
+			assert.NoError(t, err)
+			assert.NoError(t, tx.Commit()) // tx commit
+			assert.NotNil(t, entry)
+			fmt.Printf("entry key: %s\n", hex.EncodeToString(entry.Key))
 		}
 
 	})
