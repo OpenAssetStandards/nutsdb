@@ -403,6 +403,10 @@ func compare(a, b []byte) int {
 	return bytes.Compare(a, b)
 }
 
+func isKeyInRange(x, start, end []byte) bool {
+	return compare(start, x) <= 0 && compare(x, end) <= 0
+}
+
 func (t *BPTree) getAll() (numFound int, keys [][]byte, pointers []interface{}) {
 	var (
 		n    *Node
@@ -500,6 +504,10 @@ func getRecordWrapper(numFound int, keys [][]byte, pointers []interface{}) (reco
 	return records, nil
 }
 
+func getRecordWrapperSingle(key []byte, pointer interface{}) (*Record, error) {
+	return pointer.(*Record), nil
+}
+
 // PrefixScan returns records at the given prefix and limitNum.
 // limitNum: limit the number of the scanned records return.
 func (t *BPTree) PrefixScan(prefix []byte, offsetNum int, limitNum int) (records Records, off int, err error) {
@@ -557,6 +565,51 @@ func (t *BPTree) PrefixScan(prefix []byte, offsetNum int, limitNum int) (records
 
 	esr, err := getRecordWrapper(numFound, keys, pointers)
 	return esr, off, err
+}
+
+// PrefixScan returns records at the given prefix and limitNum.
+// limitNum: limit the number of the scanned records return.
+func (t *BPTree) FirstScan(start []byte, end []byte, offsetNum int) (*Record, int, error) {
+	var (
+		n        *Node
+		scanFlag bool
+		i, j     int
+	)
+
+	n = t.FindLeaf(start)
+	off := 0
+
+	if n == nil {
+		return nil, off, ErrPrefixScan
+	}
+
+	for j = 0; j < n.KeysNum && compare(n.Keys[j], start) < 0; {
+		j++
+	}
+
+	scanFlag = true
+
+	coff := 0
+
+	for n != nil && scanFlag {
+		for i = j; i < n.KeysNum; i++ {
+
+			if compare(n.Keys[i], end) >= 0 {
+				scanFlag = false
+				break
+			}
+
+			if coff < offsetNum {
+				coff++
+				continue
+			}
+			return n.pointers[i].(*Record), coff, nil
+		}
+
+		n, _ = n.pointers[order-1].(*Node)
+		j = 0
+	}
+	return nil, 0, ErrScansNoResult
 }
 
 // PrefixSearchScan returns records at the given prefix, match regular expression and limitNum
