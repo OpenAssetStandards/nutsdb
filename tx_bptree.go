@@ -227,6 +227,9 @@ func (tx *Tx) GetAll(bucket string) (entries Entries, err error) {
 
 // RangeScan query a range at given bucket, start and end slice.
 func (tx *Tx) FirstScan(bucket string, start, end []byte, offsetNum int) (*Entry, error) {
+	if bytes.Equal(start, end) {
+		return tx.Get(bucket, start)
+	}
 	if err := tx.checkTxIsClosed(); err != nil {
 		return nil, err
 	}
@@ -268,7 +271,7 @@ func (tx *Tx) FirstScan(bucket string, start, end []byte, offsetNum int) (*Entry
 			return nil, err
 		}
 		if entry == nil {
-			return nil, ErrRangeScan
+			return nil, ErrKeyNotFound
 		}
 		return entry, nil
 	}
@@ -284,7 +287,7 @@ func (tx *Tx) FirstScan(bucket string, start, end []byte, offsetNum int) (*Entry
 			return nil, ErrRangeScan
 		}
 		if e2 == nil {
-			return nil, ErrRangeScan
+			return nil, ErrKeyNotFound
 		}
 		return e2, nil
 
