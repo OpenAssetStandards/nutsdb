@@ -594,7 +594,7 @@ func (t *BPTree) FirstScan(start []byte, end []byte, offsetNum int) (*Record, in
 	for n != nil && scanFlag {
 		for i = j; i < n.KeysNum; i++ {
 
-			if compare(n.Keys[i], end) >= 0 {
+			if compare(n.Keys[i], end) > 0 {
 				scanFlag = false
 				break
 			}
